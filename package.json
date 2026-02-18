@@ -1,0 +1,28 @@
+{
+  "name": "gitcorps-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/web",
+    "functions",
+    "packages/shared",
+    "tools/agent-runner"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "dev:web": "npm run dev --workspace apps/web",
+    "dev:functions": "npm run serve --workspace functions"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "next": "14.2.35"
+  }
+}
