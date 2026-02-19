@@ -191,6 +191,22 @@ button.button-secondary {
   font-size: 0.92rem;
 }
 
+.preflight-panel {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 0.9rem;
+  margin: 1rem 0;
+  display: grid;
+  gap: 0.7rem;
+  max-width: 760px;
+}
+
+.preflight-panel h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));

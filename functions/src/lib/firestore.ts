@@ -1,9 +1,28 @@
-import { initializeApp, getApps } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getApp, initializeApp, type App } from "firebase-admin/app";
+import { getFirestore, type Firestore } from "firebase-admin/firestore";
 
-export function getDb() {
-  if (getApps().length === 0) {
-    initializeApp();
+let cachedApp: App | null = null;
+let cachedDb: Firestore | null = null;
+
+function getDefaultApp(): App {
+  if (cachedApp) {
+    return cachedApp;
   }
-  return getFirestore();
+
+  try {
+    cachedApp = getApp();
+  } catch {
+    cachedApp = initializeApp();
+  }
+
+  return cachedApp;
+}
+
+export function getDb(): Firestore {
+  if (cachedDb) {
+    return cachedDb;
+  }
+
+  cachedDb = getFirestore(getDefaultApp());
+  return cachedDb;
 }

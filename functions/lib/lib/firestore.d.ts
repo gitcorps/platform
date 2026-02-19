@@ -1,1 +1,2 @@
-export declare function getDb(): FirebaseFirestore.Firestore;
+import { type Firestore } from "firebase-admin/firestore";
+export declare function getDb(): Firestore;

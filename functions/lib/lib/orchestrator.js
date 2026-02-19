@@ -9,9 +9,38 @@ const firestore_1 = require("firebase-admin/firestore");
 const firebase_functions_1 = require("firebase-functions");
 const env_1 = require("../config/env");
 const repo_1 = require("../github/repo");
+const runner_1 = require("../templates/runner");
+const workflow_1 = require("../templates/workflow");
 const orchestratorRules_1 = require("./orchestratorRules");
 const firestore_2 = require("./firestore");
 const runToken_1 = require("./runToken");
+function isFailedPreconditionError(error) {
+    const candidate = error;
+    if (candidate?.code === 9 || candidate?.code === "failed-precondition") {
+        return true;
+    }
+    const message = typeof candidate?.message === "string" ? candidate.message : "";
+    return message.includes("FAILED_PRECONDITION") || message.includes("failed-precondition");
+}
+function serializeError(error) {
+    const candidate = error;
+    return {
+        code: candidate?.code,
+        message: typeof candidate?.message === "string" ? candidate.message : String(error),
+    };
+}
+function throwIndexHintIfNeeded(operation, error) {
+    if (isFailedPreconditionError(error)) {
+        const details = serializeError(error);
+        firebase_functions_1.logger.error("Firestore FAILED_PRECONDITION in orchestrator.", {
+            operation,
+            ...details,
+            hint: "Deploy firestore indexes (collection-group indexes for runs.status and runs.endedAt).",
+        });
+        throw new Error(`Firestore FAILED_PRECONDITION during ${operation}. Missing Firestore indexes. Deploy firestore.indexes.json. Original: ${details.message}`);
+    }
+    throw error instanceof Error ? error : new Error(String(error));
+}
 function utcDayStart(now = new Date()) {
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
@@ -21,24 +50,34 @@ async function getActiveRunCount() {
 }
 async function getGlobalDailyChargedCents(now = new Date()) {
     const start = firestore_1.Timestamp.fromDate(utcDayStart(now));
-    const snap = await (0, firestore_2.getDb)().collectionGroup("runs").where("endedAt", ">=", start).get();
-    return snap.docs.reduce((sum, doc) => {
-        const charged = doc.get("chargedCents");
-        return sum + (typeof charged === "number" ? charged : 0);
-    }, 0);
+    try {
+        const snap = await (0, firestore_2.getDb)().collectionGroup("runs").where("endedAt", ">=", start).get();
+        return snap.docs.reduce((sum, doc) => {
+            const charged = doc.get("chargedCents");
+            return sum + (typeof charged === "number" ? charged : 0);
+        }, 0);
+    }
+    catch (error) {
+        throwIndexHintIfNeeded("getGlobalDailyChargedCents", error);
+    }
 }
 async function getProjectDailyChargedCents(projectId, now = new Date()) {
     const start = firestore_1.Timestamp.fromDate(utcDayStart(now));
-    const runs = await (0, firestore_2.getDb)()
-        .collection("projects")
-        .doc(projectId)
-        .collection("runs")
-        .where("endedAt", ">=", start)
-        .get();
-    return runs.docs.reduce((sum, doc) => {
-        const charged = doc.get("chargedCents");
-        return sum + (typeof charged === "number" ? charged : 0);
-    }, 0);
+    try {
+        const runs = await (0, firestore_2.getDb)()
+            .collection("projects")
+            .doc(projectId)
+            .collection("runs")
+            .where("endedAt", ">=", start)
+            .get();
+        return runs.docs.reduce((sum, doc) => {
+            const charged = doc.get("chargedCents");
+            return sum + (typeof charged === "number" ? charged : 0);
+        }, 0);
+    }
+    catch (error) {
+        throwIndexHintIfNeeded("getProjectDailyChargedCents", error);
+    }
 }
 async function enqueueProjectForLater(projectId, reason) {
     const queueRef = (0, firestore_2.getDb)().collection("runQueue").doc(projectId);
@@ -174,6 +213,11 @@ async function maybeStartRun(projectId) {
         if (!repoFullName) {
             throw new Error("project repoFullName is missing");
         }
+        await (0, repo_1.syncProjectAutomationFiles)({
+            repoFullName,
+            workflowYaml: (0, workflow_1.gitcorpsWorkflowYaml)(),
+            runnerScript: (0, runner_1.gitcorpsRunnerScript)(),
+        });
         await (0, repo_1.dispatchWorkflow)({
             repoFullName,
             workflowFile: "gitcorps-agent.yml",
@@ -230,14 +274,30 @@ async function markRunDispatchFailure(projectId, runId, reason) {
     await enqueueProjectForLater(projectId, "dispatch_failed");
 }
 async function processRunQueueBatch(limit) {
-    const queueSnap = await (0, firestore_2.getDb)()
-        .collection("runQueue")
-        .orderBy("enqueuedAt", "asc")
-        .limit(limit)
-        .get();
+    let queueSnap;
+    try {
+        queueSnap = await (0, firestore_2.getDb)()
+            .collection("runQueue")
+            .orderBy("enqueuedAt", "asc")
+            .limit(limit)
+            .get();
+    }
+    catch (error) {
+        throwIndexHintIfNeeded("processRunQueueBatch.queryQueue", error);
+    }
     for (const doc of queueSnap.docs) {
         const projectId = String(doc.get("projectId") || doc.id);
-        const result = await maybeStartRun(projectId);
+        let result;
+        try {
+            result = await maybeStartRun(projectId);
+        }
+        catch (error) {
+            firebase_functions_1.logger.error("maybeStartRun failed during queue processing", {
+                projectId,
+                ...serializeError(error),
+            });
+            continue;
+        }
         if (result.state === "queue_enqueued" && result.gateReason === "global_concurrency") {
             break;
         }
@@ -245,7 +305,13 @@ async function processRunQueueBatch(limit) {
 }
 async function recoverStaleQueuedRuns(staleMinutes = 15) {
     const cutoff = firestore_1.Timestamp.fromDate(new Date(Date.now() - staleMinutes * 60_000));
-    const staleRuns = await (0, firestore_2.getDb)().collectionGroup("runs").where("status", "==", "queued").get();
+    let staleRuns;
+    try {
+        staleRuns = await (0, firestore_2.getDb)().collectionGroup("runs").where("status", "==", "queued").get();
+    }
+    catch (error) {
+        throwIndexHintIfNeeded("recoverStaleQueuedRuns.queryRunsByStatus", error);
+    }
     for (const runDoc of staleRuns.docs) {
         const createdAt = runDoc.get("createdAt");
         if (!createdAt || createdAt.toMillis() > cutoff.toMillis()) {
@@ -291,7 +357,13 @@ async function recoverStaleQueuedRuns(staleMinutes = 15) {
 }
 async function recoverStaleRunningRuns(staleMinutes = 90) {
     const cutoff = firestore_1.Timestamp.fromDate(new Date(Date.now() - staleMinutes * 60_000));
-    const staleRuns = await (0, firestore_2.getDb)().collectionGroup("runs").where("status", "==", "running").get();
+    let staleRuns;
+    try {
+        staleRuns = await (0, firestore_2.getDb)().collectionGroup("runs").where("status", "==", "running").get();
+    }
+    catch (error) {
+        throwIndexHintIfNeeded("recoverStaleRunningRuns.queryRunsByStatus", error);
+    }
     for (const runDoc of staleRuns.docs) {
         const heartbeatAt = runDoc.get("heartbeatAt");
         if (!heartbeatAt || heartbeatAt.toMillis() > cutoff.toMillis()) {

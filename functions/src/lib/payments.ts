@@ -1,6 +1,10 @@
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { getDb } from "./firestore";
 
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 export function amountToCents(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     if (value >= 1 && Number.isInteger(value)) {
@@ -17,6 +21,81 @@ export function amountToCents(value: unknown): number {
   }
 
   return 0;
+}
+
+export function extractPaymentIntentIdFromCheckoutSession(
+  sessionData: Record<string, unknown>,
+): string | null {
+  const directCandidates = [
+    sessionData.payment_intent,
+    sessionData.paymentIntent,
+    sessionData.payment_intent_id,
+    sessionData.paymentIntentId,
+  ];
+
+  for (const candidate of directCandidates) {
+    const stringValue = readString(candidate);
+    if (stringValue) {
+      return stringValue;
+    }
+  }
+
+  const nested = sessionData.payment_intent;
+  if (nested && typeof nested === "object") {
+    const id = readString((nested as Record<string, unknown>).id);
+    if (id) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
+export function extractCheckoutSessionIdFromPayment(
+  paymentData: Record<string, unknown>,
+): string | null {
+  const directCandidates = [
+    paymentData.checkout_session,
+    paymentData.checkoutSessionId,
+    paymentData.checkout_session_id,
+    paymentData.checkoutSession,
+    paymentData.session_id,
+    paymentData.sessionId,
+  ];
+
+  for (const candidate of directCandidates) {
+    const stringValue = readString(candidate);
+    if (stringValue) {
+      return stringValue;
+    }
+  }
+
+  const nestedCheckout = paymentData.checkout_session;
+  if (nestedCheckout && typeof nestedCheckout === "object") {
+    const id = readString((nestedCheckout as Record<string, unknown>).id);
+    if (id) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
+export function extractPaymentStatus(paymentData: Record<string, unknown>): string {
+  const statusCandidates = [
+    paymentData.status,
+    paymentData.payment_status,
+    paymentData.paymentStatus,
+  ];
+
+  for (const candidate of statusCandidates) {
+    const status = readString(candidate);
+    if (status) {
+      return status;
+    }
+  }
+
+  return "";
 }
 
 export async function resolveProjectIdForPayment(
@@ -42,12 +121,7 @@ export async function resolveProjectIdForPayment(
     }
   }
 
-  const checkoutSessionId =
-    typeof paymentData.checkout_session === "string"
-      ? paymentData.checkout_session
-      : typeof paymentData.checkoutSessionId === "string"
-        ? paymentData.checkoutSessionId
-        : null;
+  const checkoutSessionId = extractCheckoutSessionIdFromPayment(paymentData);
 
   if (checkoutSessionId) {
     const sessionMapping = await getDb().collection("checkoutSessionProjects").doc(checkoutSessionId).get();

@@ -11,6 +11,18 @@ const DEFAULTS = {
     llmProvider: "openai",
     llmModel: "gpt-4.1",
 };
+function readConfigValue(key) {
+    const direct = process.env[key];
+    if (typeof direct === "string" && direct.length > 0) {
+        return direct;
+    }
+    // Accept lowercase env aliases (e.g. from manual Cloud Run env setup).
+    const lowerAlias = process.env[key.toLowerCase()];
+    if (typeof lowerAlias === "string" && lowerAlias.length > 0) {
+        return lowerAlias;
+    }
+    return undefined;
+}
 const numberFromEnv = (defaultValue) => zod_1.z
     .string()
     .optional()
@@ -49,7 +61,28 @@ function getEnvConfig() {
     if (cachedConfig) {
         return cachedConfig;
     }
-    const parsed = envSchema.parse(process.env);
+    const resolvedEnv = {
+        ...process.env,
+        GITHUB_TOKEN: readConfigValue("GITHUB_TOKEN"),
+        GITHUB_ORG_NAME: readConfigValue("GITHUB_ORG_NAME"),
+        PUBLIC_SITE_DOMAIN: readConfigValue("PUBLIC_SITE_DOMAIN"),
+        PROJECT_SITE_TEMPLATE: readConfigValue("PROJECT_SITE_TEMPLATE"),
+        DEFAULT_LICENSE: readConfigValue("DEFAULT_LICENSE"),
+        MIN_RUN_USD: readConfigValue("MIN_RUN_USD"),
+        MAX_RUN_USD: readConfigValue("MAX_RUN_USD"),
+        GLOBAL_MAX_CONCURRENT_RUNS: readConfigValue("GLOBAL_MAX_CONCURRENT_RUNS"),
+        GLOBAL_MAX_DAILY_SPEND_USD: readConfigValue("GLOBAL_MAX_DAILY_SPEND_USD"),
+        PER_PROJECT_MAX_DAILY_SPEND_USD: readConfigValue("PER_PROJECT_MAX_DAILY_SPEND_USD"),
+        LLM_PROVIDER_DEFAULT: readConfigValue("LLM_PROVIDER_DEFAULT"),
+        LLM_MODEL_DEFAULT: readConfigValue("LLM_MODEL_DEFAULT"),
+        AGENT_RUNTIME_DEFAULT: readConfigValue("AGENT_RUNTIME_DEFAULT"),
+        BACKEND_BASE_URL: readConfigValue("BACKEND_BASE_URL"),
+        RUN_TOKEN_TTL_MINUTES: readConfigValue("RUN_TOKEN_TTL_MINUTES"),
+        RUN_QUEUE_CHECK_LIMIT: readConfigValue("RUN_QUEUE_CHECK_LIMIT"),
+        BUCKET_RUNTIME_MINUTES_PER_USD: readConfigValue("BUCKET_RUNTIME_MINUTES_PER_USD"),
+        BUCKET_TOKENS_PER_USD: readConfigValue("BUCKET_TOKENS_PER_USD"),
+    };
+    const parsed = envSchema.parse(resolvedEnv);
     cachedConfig = {
         ...parsed,
         minRunCents: usdToCents(parsed.MIN_RUN_USD),

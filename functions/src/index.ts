@@ -1,5 +1,7 @@
+import { Buffer } from "node:buffer";
 import { FieldValue } from "firebase-admin/firestore";
 import { logger } from "firebase-functions";
+import { randomUUID } from "node:crypto";
 import {
   HttpsError,
   onCall,
@@ -7,12 +9,15 @@ import {
   type CallableRequest,
 } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
-import { onDocumentCreated, onDocumentWritten } from "firebase-functions/v2/firestore";
+import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import { z } from "zod";
 import { getEnvConfig } from "./config/env";
+import { getGithubClient } from "./github/client";
 import { createProjectRepoAndSeed } from "./github/repo";
 import { getDb } from "./lib/firestore";
+import { computeRepoCreateHeuristic } from "./lib/githubPreflight";
 import {
+  enqueueProjectForLater,
   maybeStartRun,
   processRunQueueBatch,
   recoverStaleQueuedRuns,
@@ -22,6 +27,8 @@ import { computeChargedCents } from "./lib/orchestratorRules";
 import {
   amountToCents,
   creditProjectWalletFromPayment,
+  extractPaymentIntentIdFromCheckoutSession,
+  extractPaymentStatus,
   resolveProjectIdForPayment,
 } from "./lib/payments";
 import { validateRunTokenFromRequest } from "./lib/runAuth";
@@ -69,6 +76,160 @@ async function ensureUserDocument(uid: string, displayName: string | null): Prom
   await userRef.set({
     createdAt: FieldValue.serverTimestamp(),
     displayName: displayName || "GitCorps User",
+  });
+}
+
+interface PendingStripePaymentRecord {
+  uid: string;
+  paymentIntentId: string;
+  paymentData: Record<string, unknown>;
+}
+
+async function upsertPendingStripePayment(input: {
+  uid: string;
+  paymentIntentId: string;
+  paymentData: Record<string, unknown>;
+  reason: string;
+}): Promise<void> {
+  await getDb()
+    .collection("pendingStripePayments")
+    .doc(input.paymentIntentId)
+    .set(
+      {
+        uid: input.uid,
+        paymentIntentId: input.paymentIntentId,
+        paymentData: input.paymentData,
+        reason: input.reason,
+        attemptCount: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+}
+
+async function clearPendingStripePayment(paymentIntentId: string): Promise<void> {
+  await getDb().collection("pendingStripePayments").doc(paymentIntentId).delete().catch(() => {
+    // best effort
+  });
+}
+
+async function processSucceededStripePayment(
+  input: PendingStripePaymentRecord,
+): Promise<"credited" | "already_credited" | "pending_mapping" | "invalid_amount"> {
+  const projectId = await resolveProjectIdForPayment(
+    input.uid,
+    input.paymentIntentId,
+    input.paymentData,
+  );
+
+  if (!projectId) {
+    await upsertPendingStripePayment({
+      uid: input.uid,
+      paymentIntentId: input.paymentIntentId,
+      paymentData: input.paymentData,
+      reason: "project_mapping_missing",
+    });
+    return "pending_mapping";
+  }
+  const resolvedProjectId = projectId;
+
+  const amountCents = amountToCents(
+    input.paymentData.amount_received ??
+      input.paymentData.amount ??
+      input.paymentData.amount_total ??
+      input.paymentData.amount_capturable,
+  );
+
+  if (amountCents <= 0) {
+    await upsertPendingStripePayment({
+      uid: input.uid,
+      paymentIntentId: input.paymentIntentId,
+      paymentData: input.paymentData,
+      reason: "invalid_amount",
+    });
+
+    logger.error("Stripe payment had invalid amount", {
+      paymentIntentId: input.paymentIntentId,
+      rawAmount:
+        input.paymentData.amount_received ??
+        input.paymentData.amount ??
+        input.paymentData.amount_total,
+    });
+    return "invalid_amount";
+  }
+
+  const credited = await creditProjectWalletFromPayment({
+    projectId: resolvedProjectId,
+    paymentIntentId: input.paymentIntentId,
+    uid: input.uid || null,
+    amountCents,
+  });
+
+  async function tryStartRunFromFunding(source: "credited" | "already_credited"): Promise<void> {
+    try {
+      const runResult = await maybeStartRun(resolvedProjectId);
+      logger.info("maybeStartRun evaluated after funding event", {
+        projectId: resolvedProjectId,
+        paymentIntentId: input.paymentIntentId,
+        source,
+        runResult,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("maybeStartRun threw after funding event; enqueueing fallback", {
+        projectId: resolvedProjectId,
+        paymentIntentId: input.paymentIntentId,
+        source,
+        error: message,
+      });
+      await enqueueProjectForLater(resolvedProjectId, "post_funding_start_failed");
+    }
+  }
+
+  if (!credited) {
+    await clearPendingStripePayment(input.paymentIntentId);
+    logger.info("Payment was already applied (idempotent)", {
+      paymentIntentId: input.paymentIntentId,
+      projectId: resolvedProjectId,
+    });
+    await tryStartRunFromFunding("already_credited");
+    return "already_credited";
+  }
+
+  await clearPendingStripePayment(input.paymentIntentId);
+  await tryStartRunFromFunding("credited");
+  return "credited";
+}
+
+async function processPendingStripePaymentIfPresent(
+  paymentIntentId: string,
+  fallbackUid: string,
+): Promise<void> {
+  const pendingSnap = await getDb().collection("pendingStripePayments").doc(paymentIntentId).get();
+  if (!pendingSnap.exists) {
+    return;
+  }
+
+  const pendingData = pendingSnap.data() as Record<string, unknown>;
+  const pendingUid = typeof pendingData.uid === "string" ? pendingData.uid : fallbackUid;
+  const pendingPaymentData =
+    pendingData.paymentData && typeof pendingData.paymentData === "object"
+      ? (pendingData.paymentData as Record<string, unknown>)
+      : null;
+
+  if (!pendingUid || !pendingPaymentData) {
+    logger.error("Pending stripe payment record missing required fields", {
+      paymentIntentId,
+      pendingUidType: typeof pendingData.uid,
+      pendingPaymentDataType: typeof pendingData.paymentData,
+    });
+    return;
+  }
+
+  await processSucceededStripePayment({
+    uid: pendingUid,
+    paymentIntentId,
+    paymentData: pendingPaymentData,
   });
 }
 
@@ -234,6 +395,11 @@ export const createFundingCheckoutSession = onCall(
       metadata: {
         projectId: payload.projectId,
       },
+      payment_intent_data: {
+        metadata: {
+          projectId: payload.projectId,
+        },
+      },
       line_items: [
         {
           quantity: 1,
@@ -281,14 +447,15 @@ export const onCheckoutSessionUpdated = onDocumentWritten(
       return;
     }
 
-    const afterData = after.data() || {};
-    const paymentIntentId = afterData.payment_intent;
-    if (typeof paymentIntentId !== "string" || paymentIntentId.length === 0) {
+    const afterData = (after.data() || {}) as Record<string, unknown>;
+    const paymentIntentId = extractPaymentIntentIdFromCheckoutSession(afterData);
+    if (!paymentIntentId) {
       return;
     }
 
-    const beforePaymentIntent = before?.exists ? before.data()?.payment_intent : undefined;
-    if (beforePaymentIntent === paymentIntentId) {
+    const beforeData = (before?.exists ? before.data() : {}) as Record<string, unknown>;
+    const beforePaymentIntentId = extractPaymentIntentIdFromCheckoutSession(beforeData);
+    if (beforePaymentIntentId === paymentIntentId) {
       return;
     }
 
@@ -318,61 +485,95 @@ export const onCheckoutSessionUpdated = onDocumentWritten(
         },
         { merge: true },
       );
+
+    await processPendingStripePaymentIfPresent(paymentIntentId, event.params.uid);
   },
 );
 
-export const onStripePaymentSucceeded = onDocumentCreated(
+export const onPaymentIntentProjectMapped = onDocumentWritten(
+  {
+    region,
+    document: "paymentIntentProjects/{paymentIntentId}",
+  },
+  async (event) => {
+    const after = event.data?.after;
+    const before = event.data?.before;
+
+    if (!after?.exists) {
+      return;
+    }
+
+    const paymentIntentId = String(event.params.paymentIntentId || "");
+    if (!paymentIntentId) {
+      return;
+    }
+
+    const afterProjectId = after.get("projectId");
+    if (typeof afterProjectId !== "string" || afterProjectId.length === 0) {
+      return;
+    }
+
+    const beforeProjectId = before?.exists ? before.get("projectId") : undefined;
+    if (beforeProjectId === afterProjectId) {
+      return;
+    }
+
+    const fallbackUid =
+      typeof after.get("uid") === "string" && String(after.get("uid")).length > 0
+        ? String(after.get("uid"))
+        : "";
+
+    await processPendingStripePaymentIfPresent(paymentIntentId, fallbackUid);
+  },
+);
+
+export const onStripePaymentSucceeded = onDocumentWritten(
   {
     region,
     document: "customers/{uid}/payments/{paymentIntentId}",
   },
   async (event) => {
+    const after = event.data?.after;
+    const before = event.data?.before;
+    if (!after?.exists) {
+      return;
+    }
+
     const uid = String(event.params.uid || "");
     const paymentIntentId = String(event.params.paymentIntentId || "");
-    const paymentData = event.data?.data() || {};
+    const paymentData = (after.data() || {}) as Record<string, unknown>;
+    const beforeData = (before?.exists ? before.data() : {}) as Record<string, unknown>;
 
-    const status = String(paymentData.status || "succeeded");
-    if (status !== "succeeded") {
+    const status = extractPaymentStatus(paymentData).toLowerCase();
+    const beforeStatus = extractPaymentStatus(beforeData).toLowerCase();
+    const succeededStatuses = new Set(["succeeded", "paid"]);
+
+    if (!succeededStatuses.has(status)) {
       logger.info("Ignoring non-succeeded payment event", { paymentIntentId, status });
       return;
     }
 
-    const projectId = await resolveProjectIdForPayment(
-      uid,
-      paymentIntentId,
-      paymentData as Record<string, unknown>,
-    );
-
-    if (!projectId) {
-      logger.error("Unable to map Stripe payment to project", { uid, paymentIntentId });
-      return;
-    }
-
-    const amountCents = amountToCents(
-      paymentData.amount_received ?? paymentData.amount ?? paymentData.amount_total,
-    );
-
-    if (amountCents <= 0) {
-      logger.error("Stripe payment had invalid amount", {
+    if (succeededStatuses.has(beforeStatus)) {
+      logger.info("Ignoring duplicate succeeded payment transition", {
         paymentIntentId,
-        rawAmount: paymentData.amount_received ?? paymentData.amount,
+        status,
+        beforeStatus,
       });
       return;
     }
 
-    const credited = await creditProjectWalletFromPayment({
-      projectId,
+    const result = await processSucceededStripePayment({
+      uid,
       paymentIntentId,
-      uid: uid || null,
-      amountCents,
+      paymentData,
     });
 
-    if (!credited) {
-      logger.info("Payment was already applied (idempotent)", { paymentIntentId, projectId });
-      return;
-    }
-
-    await maybeStartRun(projectId);
+    logger.info("Processed succeeded Stripe payment", {
+      paymentIntentId,
+      uid,
+      status,
+      result,
+    });
   },
 );
 
@@ -537,6 +738,64 @@ export const recoverStaleRuns = onSchedule(
   },
 );
 
+export const retryPendingStripePayments = onSchedule(
+  {
+    region,
+    schedule: "every 5 minutes",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    const pendingSnapshot = await getDb().collection("pendingStripePayments").limit(50).get();
+    if (pendingSnapshot.empty) {
+      return;
+    }
+
+    const outcomeCounts: Record<string, number> = {
+      credited: 0,
+      already_credited: 0,
+      pending_mapping: 0,
+      invalid_amount: 0,
+    };
+
+    for (const doc of pendingSnapshot.docs) {
+      const data = doc.data() as Record<string, unknown>;
+      const uid = typeof data.uid === "string" ? data.uid : "";
+      const paymentData =
+        data.paymentData && typeof data.paymentData === "object"
+          ? (data.paymentData as Record<string, unknown>)
+          : null;
+
+      if (!uid || !paymentData) {
+        logger.error("Skipping malformed pendingStripePayments document", {
+          paymentIntentId: doc.id,
+          uidType: typeof data.uid,
+          paymentDataType: typeof data.paymentData,
+        });
+        continue;
+      }
+
+      try {
+        const outcome = await processSucceededStripePayment({
+          uid,
+          paymentIntentId: doc.id,
+          paymentData,
+        });
+        outcomeCounts[outcome] = (outcomeCounts[outcome] ?? 0) + 1;
+      } catch (error) {
+        logger.error("retryPendingStripePayments failed for payment", {
+          paymentIntentId: doc.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    logger.info("retryPendingStripePayments completed", {
+      scanned: pendingSnapshot.size,
+      outcomes: outcomeCounts,
+    });
+  },
+);
+
 export const maybeStartRunCallable = onCall(
   {
     region,
@@ -555,5 +814,220 @@ export const maybeStartRunCallable = onCall(
         githubOrgName: getEnvConfig().GITHUB_ORG_NAME || "gitcorps",
       },
     };
+  },
+);
+
+export const githubPreflight = onCall(
+  {
+    region,
+    memory: "256MiB",
+  },
+  async (request) => {
+    assertAuth(request);
+    const payload = z
+      .object({
+        writeProbe: z.boolean().optional(),
+      })
+      .parse(request.data ?? {});
+    const writeProbeRequested = payload.writeProbe === true;
+
+    const config = getEnvConfig();
+    const org = config.GITHUB_ORG_NAME;
+    const tokenPresent = Boolean(config.GITHUB_TOKEN);
+
+    const result: {
+      ok: boolean;
+      org: string;
+      tokenPresent: boolean;
+      viewer?: { login: string; id: number; type: string };
+      oauthScopes?: string | null;
+      acceptedOauthScopes?: string | null;
+      orgReachable: boolean;
+      orgSettings?: {
+        membersCanCreateRepositories?: boolean;
+        defaultRepositoryPermission?: string;
+      };
+      membership?: { state?: string; role?: string };
+      writeProbeRequested: boolean;
+      writeProbeSucceeded?: boolean;
+      writeProbeRepoName?: string;
+      writeProbeRepoUrl?: string;
+      writeProbeDetails?: {
+        repoCreated: boolean;
+        contentsWriteOk: boolean;
+        workflowWriteOk: boolean;
+        repoDeleted: boolean;
+      };
+      checks: string[];
+      repoCreateHeuristic: "likely" | "unknown" | "unlikely";
+      errors: Array<{ step: string; status?: number; message: string }>;
+    } = {
+      ok: true,
+      org,
+      tokenPresent,
+      orgReachable: false,
+      writeProbeRequested,
+      checks: [],
+      repoCreateHeuristic: "unknown",
+      errors: [],
+    };
+
+    if (!tokenPresent) {
+      result.ok = false;
+      result.errors.push({
+        step: "token",
+        message: "GITHUB_TOKEN is not configured.",
+      });
+      result.repoCreateHeuristic = "unlikely";
+      return result;
+    }
+
+    const octokit = await getGithubClient();
+    let viewerReachable = false;
+
+    try {
+      const viewerResp = await octokit.users.getAuthenticated();
+      viewerReachable = true;
+      result.viewer = viewerResp.data;
+
+      const scopesHeader = viewerResp.headers["x-oauth-scopes"];
+      const acceptedHeader = viewerResp.headers["x-accepted-oauth-scopes"];
+      result.oauthScopes = scopesHeader ? String(scopesHeader) : null;
+      result.acceptedOauthScopes = acceptedHeader ? String(acceptedHeader) : null;
+      result.checks.push("viewer_ok");
+    } catch (error) {
+      const err = error as { status?: number; message?: string };
+      result.ok = false;
+      result.errors.push({
+        step: "viewer",
+        status: err.status,
+        message: err.message || "Failed to read authenticated viewer.",
+      });
+    }
+
+    try {
+      const orgResp = await octokit.orgs.get({ org });
+      result.orgReachable = true;
+      result.orgSettings = {
+        membersCanCreateRepositories: orgResp.data.members_can_create_repositories,
+        defaultRepositoryPermission: orgResp.data.default_repository_permission,
+      };
+      result.checks.push("org_ok");
+    } catch (error) {
+      const err = error as { status?: number; message?: string };
+      result.ok = false;
+      result.errors.push({
+        step: "org",
+        status: err.status,
+        message: err.message || "Failed to access organization.",
+      });
+    }
+
+    try {
+      const membershipResp = await octokit.orgs.getMembershipForAuthenticatedUser({ org });
+      result.membership = {
+        state: membershipResp.data.state,
+        role: membershipResp.data.role,
+      };
+      result.checks.push("membership_ok");
+    } catch (error) {
+      const err = error as { status?: number; message?: string };
+      result.errors.push({
+        step: "membership",
+        status: err.status,
+        message: err.message || "Could not resolve org membership for authenticated user.",
+      });
+    }
+
+    result.repoCreateHeuristic = computeRepoCreateHeuristic({
+      tokenPresent,
+      viewerReachable,
+      orgReachable: result.orgReachable,
+      membership: result.membership,
+      orgSettings: result.orgSettings,
+    });
+
+    if (result.repoCreateHeuristic === "unlikely") {
+      result.ok = false;
+    }
+
+    if (writeProbeRequested) {
+      const probeRepoName = `gitcorps-preflight-${Date.now()}-${randomUUID().slice(0, 8)}`;
+      result.writeProbeRepoName = probeRepoName;
+      result.writeProbeDetails = {
+        repoCreated: false,
+        contentsWriteOk: false,
+        workflowWriteOk: false,
+        repoDeleted: false,
+      };
+
+      try {
+        const createResp = await octokit.repos.createInOrg({
+          org,
+          name: probeRepoName,
+          description: "Temporary GitCorps preflight repo. Safe to delete.",
+          private: false,
+          has_issues: false,
+          has_projects: false,
+          has_wiki: false,
+          auto_init: false,
+          license_template: "mit",
+        });
+
+        result.writeProbeDetails.repoCreated = true;
+        result.writeProbeRepoUrl = createResp.data.html_url;
+        result.checks.push("write_probe_create_ok");
+
+        await octokit.repos.createOrUpdateFileContents({
+          owner: org,
+          repo: probeRepoName,
+          path: ".gitcorps-preflight.txt",
+          message: "chore(preflight): verify contents write",
+          content: Buffer.from("ok\n", "utf8").toString("base64"),
+          branch: "main",
+        });
+        result.writeProbeDetails.contentsWriteOk = true;
+        result.checks.push("write_probe_contents_ok");
+
+        await octokit.repos.createOrUpdateFileContents({
+          owner: org,
+          repo: probeRepoName,
+          path: ".github/workflows/preflight-check.yml",
+          message: "chore(preflight): verify workflow write",
+          content: Buffer.from("name: preflight-check\non: workflow_dispatch\njobs: {}\n", "utf8").toString("base64"),
+          branch: "main",
+        });
+        result.writeProbeDetails.workflowWriteOk = true;
+        result.checks.push("write_probe_workflow_ok");
+
+        await octokit.repos.delete({
+          owner: org,
+          repo: probeRepoName,
+        });
+        result.writeProbeDetails.repoDeleted = true;
+        result.writeProbeSucceeded = true;
+        result.checks.push("write_probe_delete_ok");
+      } catch (error) {
+        const err = error as { status?: number; message?: string };
+        result.writeProbeSucceeded = false;
+        result.ok = false;
+        result.errors.push({
+          step:
+            result.writeProbeDetails.repoCreated && !result.writeProbeDetails.contentsWriteOk
+              ? "writeProbeContents"
+              : result.writeProbeDetails.repoCreated &&
+                  result.writeProbeDetails.contentsWriteOk &&
+                  !result.writeProbeDetails.workflowWriteOk
+                ? "writeProbeWorkflow"
+                : result.writeProbeDetails.repoCreated ? "writeProbeDelete" : "writeProbeCreate",
+          status: err.status,
+          message:
+            err.message ||
+            "Write probe failed while creating or deleting temporary repository.",
+        });
+      }
+    }
+
+    return result;
   },
 );

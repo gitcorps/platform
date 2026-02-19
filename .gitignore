@@ -9,6 +9,7 @@ package-lock.json
 **/.cache
 .env
 .env.*
+!functions/.env.example
 .firebase
 *.log
 coverage

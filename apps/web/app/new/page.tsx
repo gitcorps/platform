@@ -7,7 +7,9 @@ import {
   createFundingCheckoutSession,
   createProject,
   isSlugAvailable,
+  runGithubPreflight,
   waitForCheckoutUrl,
+  type GithubPreflightResult,
 } from "../../src/lib/api";
 import {
   getFirebaseAuth,
@@ -37,6 +39,10 @@ export default function NewProjectPage() {
   const [initialFundingUsd, setInitialFundingUsd] = useState(25);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+  const [preflightResult, setPreflightResult] = useState<GithubPreflightResult | null>(null);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [preflightWriteProbe, setPreflightWriteProbe] = useState(false);
   const [slugStatus, setSlugStatus] = useState<"unknown" | "checking" | "available" | "taken">(
     "unknown",
   );
@@ -125,6 +131,22 @@ export default function NewProjectPage() {
     }
   }
 
+  async function handleRunPreflight() {
+    setPreflightError(null);
+    setPreflightLoading(true);
+    setPreflightResult(null);
+
+    try {
+      await ensureSignedIn();
+      const result = await runGithubPreflight(preflightWriteProbe);
+      setPreflightResult(result);
+    } catch (runError) {
+      setPreflightError(runError instanceof Error ? runError.message : String(runError));
+    } finally {
+      setPreflightLoading(false);
+    }
+  }
+
   return (
     <section>
       <h1>Create Project</h1>
@@ -133,6 +155,37 @@ export default function NewProjectPage() {
         runs.
       </p>
       <Disclaimer />
+      <section className="preflight-panel">
+        <h2>GitHub Preflight (Temporary)</h2>
+        <p className="muted">
+          Runs backend `githubPreflight` so you can verify token/org access before creating a
+          project.
+        </p>
+        <label>
+          <input
+            type="checkbox"
+            checked={preflightWriteProbe}
+            onChange={(event) => {
+              setPreflightWriteProbe(event.target.checked);
+            }}
+          />
+          Include write probe (creates and deletes a temporary repo)
+        </label>
+        <button
+          className="button-secondary"
+          type="button"
+          disabled={!firebaseConfigured || preflightLoading}
+          onClick={() => {
+            void handleRunPreflight();
+          }}
+        >
+          {preflightLoading ? "Running preflight..." : "Run GitHub Preflight"}
+        </button>
+        {preflightError ? <p className="muted">Preflight error: {preflightError}</p> : null}
+        {preflightResult ? (
+          <pre>{JSON.stringify(preflightResult, null, 2)}</pre>
+        ) : null}
+      </section>
       {!firebaseConfigured ? (
         <p className="muted">Firebase config is missing. Set NEXT_PUBLIC_FIREBASE_* values.</p>
       ) : null}

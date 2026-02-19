@@ -59,10 +59,11 @@ jobs:
 
       - name: Notify backend runStarted
         run: |
+          START_PAYLOAD=$(node -e 'process.stdout.write(JSON.stringify({projectId: process.env.PROJECT_ID, runId: process.env.RUN_ID}))')
           curl -fsSL -X POST "$BACKEND_BASE_URL/runStarted" \\
             -H "Authorization: Bearer $RUN_TOKEN" \\
             -H "Content-Type: application/json" \\
-            -d "{\"projectId\":\"$PROJECT_ID\",\"runId\":\"$RUN_ID\"}"
+            -d "$START_PAYLOAD"
 
       - name: Execute agent runner
         run: |
@@ -102,10 +103,10 @@ jobs:
       - name: Notify backend runFinished
         if: always()
         run: |
-          SUMMARY_JSON=$(node -e "const fs=require('fs');const p='RUN_SUMMARY.md';const txt=fs.existsSync(p)?fs.readFileSync(p,'utf8'):'Run finished without summary.';process.stdout.write(JSON.stringify(txt));")
+          FINISH_PAYLOAD=$(node -e 'const fs=require("fs");const p="RUN_SUMMARY.md";const txt=fs.existsSync(p)?fs.readFileSync(p,"utf8"):"Run finished without summary.";const spent=Number(process.env.BUDGET_CENTS||"0");process.stdout.write(JSON.stringify({projectId:process.env.PROJECT_ID,runId:process.env.RUN_ID,status:process.env.RUN_STATUS||"failed",spentCents:Number.isFinite(spent)?spent:0,summaryMd:txt}));')
           curl -fsSL -X POST "$BACKEND_BASE_URL/runFinished" \\
             -H "Authorization: Bearer $RUN_TOKEN" \\
             -H "Content-Type: application/json" \\
-            -d "{\"projectId\":\"$PROJECT_ID\",\"runId\":\"$RUN_ID\",\"status\":\"$RUN_STATUS\",\"spentCents\":$BUDGET_CENTS,\"summaryMd\":$SUMMARY_JSON}"
+            -d "$FINISH_PAYLOAD"
 `;
 }

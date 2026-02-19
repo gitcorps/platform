@@ -71,18 +71,78 @@ function extractJsonObject(raw) {
   }
 }
 
+function normalizeBaseUrl(baseUrl, defaultBaseUrl) {
+  const candidate = (baseUrl || '').trim();
+  const chosen = candidate.length > 0 ? candidate : defaultBaseUrl;
+  return chosen.replace(/\\/+$/, '');
+}
+
+function asSnippet(input, maxLen = 400) {
+  const text = typeof input === 'string' ? input : String(input || '');
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + '...[truncated]';
+}
+
+function extractOpenAIResponsesText(json) {
+  if (typeof json?.output_text === 'string' && json.output_text.length > 0) {
+    return json.output_text;
+  }
+
+  if (Array.isArray(json?.output)) {
+    const parts = [];
+    for (const item of json.output) {
+      if (!item || typeof item !== 'object') continue;
+      const content = Array.isArray(item.content) ? item.content : [];
+      for (const block of content) {
+        if (!block || typeof block !== 'object') continue;
+        if (typeof block.text === 'string' && block.text.length > 0) {
+          parts.push(block.text);
+        }
+      }
+    }
+    if (parts.length > 0) {
+      return parts.join('\\n');
+    }
+  }
+
+  return '';
+}
+
 class OpenAICompatibleProvider {
   constructor(config) {
     this.apiKey = config.apiKey;
     this.model = config.model;
-    this.baseUrl = config.baseUrl || 'https://api.openai.com/v1';
+    this.baseUrl = normalizeBaseUrl(config.baseUrl, 'https://api.openai.com/v1');
   }
 
-  async complete(prompt) {
-    if (!this.apiKey) {
-      throw new Error('OPENAI_API_KEY is missing');
+  async parseErrorResponse(response) {
+    const body = await response.text().catch(() => '');
+    return 'status=' + response.status + ' body=' + asSnippet(body);
+  }
+
+  async requestResponses(prompt) {
+    const response = await fetch(this.baseUrl + '/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + this.apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: this.model,
+        instructions: 'You are GitCorps autonomous coding agent planner.',
+        input: prompt,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('responses endpoint failed: ' + (await this.parseErrorResponse(response)));
     }
 
+    const json = await response.json();
+    return extractOpenAIResponsesText(json);
+  }
+
+  async requestChatCompletions(prompt) {
     const response = await fetch(this.baseUrl + '/chat/completions', {
       method: 'POST',
       headers: {
@@ -91,7 +151,6 @@ class OpenAICompatibleProvider {
       },
       body: JSON.stringify({
         model: this.model,
-        temperature: 0.2,
         messages: [
           { role: 'system', content: 'You are GitCorps autonomous coding agent planner.' },
           { role: 'user', content: prompt },
@@ -100,11 +159,42 @@ class OpenAICompatibleProvider {
     });
 
     if (!response.ok) {
-      throw new Error('OpenAI-compatible request failed: ' + response.status);
+      throw new Error(
+        'chat/completions endpoint failed: ' + (await this.parseErrorResponse(response)),
+      );
     }
 
     const json = await response.json();
     return json.choices?.[0]?.message?.content || '';
+  }
+
+  async complete(prompt) {
+    if (!this.apiKey) {
+      throw new Error('OPENAI_API_KEY is missing');
+    }
+    const errors = [];
+
+    try {
+      const output = await this.requestResponses(prompt);
+      if (output && output.length > 0) {
+        return output;
+      }
+      errors.push('responses endpoint returned empty output');
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+      const output = await this.requestChatCompletions(prompt);
+      if (output && output.length > 0) {
+        return output;
+      }
+      errors.push('chat/completions endpoint returned empty output');
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+
+    throw new Error('OpenAI-compatible request failed. Attempts: ' + errors.join(' | '));
   }
 }
 
@@ -112,7 +202,7 @@ class AnthropicCompatibleProvider {
   constructor(config) {
     this.apiKey = config.apiKey;
     this.model = config.model;
-    this.baseUrl = config.baseUrl || 'https://api.anthropic.com';
+    this.baseUrl = normalizeBaseUrl(config.baseUrl, 'https://api.anthropic.com');
   }
 
   async complete(prompt) {
@@ -136,7 +226,13 @@ class AnthropicCompatibleProvider {
     });
 
     if (!response.ok) {
-      throw new Error('Anthropic-compatible request failed: ' + response.status);
+      const body = await response.text().catch(() => '');
+      throw new Error(
+        'Anthropic-compatible request failed: status=' +
+          response.status +
+          ' body=' +
+          asSnippet(body),
+      );
     }
 
     const json = await response.json();
@@ -195,7 +291,22 @@ class LlmRuntime {
       context.tree.join('\\n'),
     ].join('\\n');
 
-    const completion = await this.provider.complete(prompt);
+    let completion = '';
+    try {
+      completion = await this.provider.complete(prompt);
+    } catch (error) {
+      const fallback = await new HeuristicRuntime().plan(context);
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ...fallback,
+        broken: 'LLM request failed: ' + message,
+        summary:
+          fallback.summary +
+          ' Provider call failed; runner continued in heuristic mode. Details: ' +
+          message,
+      };
+    }
+
     const json = extractJsonObject(completion);
 
     if (!json) {

@@ -1,10 +1,16 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.amountToCents = amountToCents;
+exports.extractPaymentIntentIdFromCheckoutSession = extractPaymentIntentIdFromCheckoutSession;
+exports.extractCheckoutSessionIdFromPayment = extractCheckoutSessionIdFromPayment;
+exports.extractPaymentStatus = extractPaymentStatus;
 exports.resolveProjectIdForPayment = resolveProjectIdForPayment;
 exports.creditProjectWalletFromPayment = creditProjectWalletFromPayment;
 const firestore_1 = require("firebase-admin/firestore");
 const firestore_2 = require("./firestore");
+function readString(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
 function amountToCents(value) {
     if (typeof value === "number" && Number.isFinite(value)) {
         if (value >= 1 && Number.isInteger(value)) {
@@ -19,6 +25,66 @@ function amountToCents(value) {
         }
     }
     return 0;
+}
+function extractPaymentIntentIdFromCheckoutSession(sessionData) {
+    const directCandidates = [
+        sessionData.payment_intent,
+        sessionData.paymentIntent,
+        sessionData.payment_intent_id,
+        sessionData.paymentIntentId,
+    ];
+    for (const candidate of directCandidates) {
+        const stringValue = readString(candidate);
+        if (stringValue) {
+            return stringValue;
+        }
+    }
+    const nested = sessionData.payment_intent;
+    if (nested && typeof nested === "object") {
+        const id = readString(nested.id);
+        if (id) {
+            return id;
+        }
+    }
+    return null;
+}
+function extractCheckoutSessionIdFromPayment(paymentData) {
+    const directCandidates = [
+        paymentData.checkout_session,
+        paymentData.checkoutSessionId,
+        paymentData.checkout_session_id,
+        paymentData.checkoutSession,
+        paymentData.session_id,
+        paymentData.sessionId,
+    ];
+    for (const candidate of directCandidates) {
+        const stringValue = readString(candidate);
+        if (stringValue) {
+            return stringValue;
+        }
+    }
+    const nestedCheckout = paymentData.checkout_session;
+    if (nestedCheckout && typeof nestedCheckout === "object") {
+        const id = readString(nestedCheckout.id);
+        if (id) {
+            return id;
+        }
+    }
+    return null;
+}
+function extractPaymentStatus(paymentData) {
+    const statusCandidates = [
+        paymentData.status,
+        paymentData.payment_status,
+        paymentData.paymentStatus,
+    ];
+    for (const candidate of statusCandidates) {
+        const status = readString(candidate);
+        if (status) {
+            return status;
+        }
+    }
+    return "";
 }
 async function resolveProjectIdForPayment(uid, paymentIntentId, paymentData) {
     const metadata = paymentData.metadata;
@@ -35,11 +101,7 @@ async function resolveProjectIdForPayment(uid, paymentIntentId, paymentData) {
             return mappedProjectId;
         }
     }
-    const checkoutSessionId = typeof paymentData.checkout_session === "string"
-        ? paymentData.checkout_session
-        : typeof paymentData.checkoutSessionId === "string"
-            ? paymentData.checkoutSessionId
-            : null;
+    const checkoutSessionId = extractCheckoutSessionIdFromPayment(paymentData);
     if (checkoutSessionId) {
         const sessionMapping = await (0, firestore_2.getDb)().collection("checkoutSessionProjects").doc(checkoutSessionId).get();
         if (sessionMapping.exists) {

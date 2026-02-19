@@ -37,6 +37,34 @@ export interface CreateCheckoutResult {
   sessionId: string;
 }
 
+export interface GithubPreflightResult {
+  ok: boolean;
+  org: string;
+  tokenPresent: boolean;
+  viewer?: { login: string; id: number; type: string };
+  oauthScopes?: string | null;
+  acceptedOauthScopes?: string | null;
+  orgReachable: boolean;
+  orgSettings?: {
+    membersCanCreateRepositories?: boolean;
+    defaultRepositoryPermission?: string;
+  };
+  membership?: { state?: string; role?: string };
+  writeProbeRequested: boolean;
+  writeProbeSucceeded?: boolean;
+  writeProbeRepoName?: string;
+  writeProbeRepoUrl?: string;
+  writeProbeDetails?: {
+    repoCreated: boolean;
+    contentsWriteOk: boolean;
+    workflowWriteOk: boolean;
+    repoDeleted: boolean;
+  };
+  checks: string[];
+  repoCreateHeuristic: "likely" | "unknown" | "unlikely";
+  errors: Array<{ step: string; status?: number; message: string }>;
+}
+
 export async function createProject(input: CreateProjectInput): Promise<CreateProjectResult> {
   const callable = httpsCallable<CreateProjectInput, CreateProjectResult>(
     getFirebaseFunctions(),
@@ -54,6 +82,17 @@ export async function createFundingCheckoutSession(
     "createFundingCheckoutSession",
   );
   const result = await callable(input);
+  return result.data;
+}
+
+export async function runGithubPreflight(
+  writeProbe = false,
+): Promise<GithubPreflightResult> {
+  const callable = httpsCallable<{ writeProbe?: boolean }, GithubPreflightResult>(
+    getFirebaseFunctions(),
+    "githubPreflight",
+  );
+  const result = await callable({ writeProbe });
   return result.data;
 }
 

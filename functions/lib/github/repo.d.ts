@@ -12,6 +12,11 @@ export interface CreatedRepo {
     repoFullName: string;
     repoUrl: string;
 }
+export declare function syncProjectAutomationFiles(input: {
+    repoFullName: string;
+    workflowYaml: string;
+    runnerScript: string;
+}): Promise<void>;
 export declare function createProjectRepoAndSeed(input: CreateRepoInput): Promise<CreatedRepo>;
 export interface DispatchWorkflowInput {
     repoFullName: string;
