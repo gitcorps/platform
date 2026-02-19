@@ -37,6 +37,17 @@ export interface CreateCheckoutResult {
   sessionId: string;
 }
 
+export interface DeleteProjectInput {
+  projectId: string;
+  confirmationName: string;
+}
+
+export interface DeleteProjectResult {
+  ok: boolean;
+  projectId: string;
+  repoDeleted: boolean;
+}
+
 export interface GithubPreflightResult {
   ok: boolean;
   org: string;
@@ -80,6 +91,17 @@ export async function createFundingCheckoutSession(
   const callable = httpsCallable<CreateCheckoutInput, CreateCheckoutResult>(
     getFirebaseFunctions(),
     "createFundingCheckoutSession",
+  );
+  const result = await callable(input);
+  return result.data;
+}
+
+export async function deleteProject(
+  input: DeleteProjectInput,
+): Promise<DeleteProjectResult> {
+  const callable = httpsCallable<DeleteProjectInput, DeleteProjectResult>(
+    getFirebaseFunctions(),
+    "deleteProject",
   );
   const result = await callable(input);
   return result.data;

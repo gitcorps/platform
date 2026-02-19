@@ -64,5 +64,6 @@ describe("env config", () => {
     expect(config.GITHUB_TOKEN).toBe("legacy-token");
     expect(config.minRunCents).toBe(400);
     expect(config.BACKEND_BASE_URL).toBe("https://example.invalid");
+    expect(config.AGENT_RUNTIME_DEFAULT).toBe("copilot_cli");
   });
 });

@@ -29,10 +29,15 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       PROJECT_ID: \${{ inputs.projectId }}
       RUN_ID: \${{ inputs.runId }}
@@ -40,12 +45,15 @@ jobs:
       RUN_TOKEN: \${{ inputs.runToken }}
       BACKEND_BASE_URL: \${{ inputs.backendBaseUrl }}
       AGENT_RUNTIME: \${{ inputs.agentRuntime }}
+      GITCORPS_BOT_TOKEN: \${{ secrets.GITCORPS_BOT_TOKEN }}
       LLM_PROVIDER_DEFAULT: \${{ vars.LLM_PROVIDER_DEFAULT || 'openai' }}
       LLM_MODEL_DEFAULT: \${{ vars.LLM_MODEL_DEFAULT || 'gpt-4.1' }}
       OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}
       OPENAI_BASE_URL: \${{ vars.OPENAI_BASE_URL }}
       ANTHROPIC_API_KEY: \${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_BASE_URL: \${{ vars.ANTHROPIC_BASE_URL }}
+      GITCORPS_COPILOT_AGENT_NAME: \${{ vars.GITCORPS_COPILOT_AGENT_NAME || 'gitcorps' }}
+      RUN_SPENT_CENTS: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,12 +63,29 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+
+      - name: Install Copilot CLI
+        run: npm_config_ignore_scripts=false npm install -g @github/copilot
+
+      - name: Configure Copilot auth
+        run: |
+          if [ -z "$GITCORPS_BOT_TOKEN" ]; then
+            echo "Missing GITCORPS_BOT_TOKEN." >&2
+            exit 1
+          fi
+          echo "GH_TOKEN=$GITCORPS_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "GITHUB_TOKEN=$GITCORPS_BOT_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Validate Copilot CLI
+        run: |
+          copilot --version
+          copilot --help >/dev/null
 
       - name: Notify backend runStarted
         run: |
           START_PAYLOAD=$(node -e 'process.stdout.write(JSON.stringify({projectId: process.env.PROJECT_ID, runId: process.env.RUN_ID}))')
-          curl -fsSL -X POST "$BACKEND_BASE_URL/runStarted" \\
+          curl -fsSL --retry 3 --retry-all-errors -X POST "$BACKEND_BASE_URL/runStarted" \\
             -H "Authorization: Bearer $RUN_TOKEN" \\
             -H "Content-Type: application/json" \\
             -d "$START_PAYLOAD"
@@ -81,30 +106,43 @@ jobs:
 
       - name: Commit agent changes
         run: |
-          if git diff --quiet; then
+          if [ -z "$(git status --porcelain)" ]; then
             echo "No changes to commit"
             exit 0
           fi
-
           git config user.name "gitcorps-agent"
           git config user.email "agent@gitcorps.local"
           git add -A
           git commit -m "chore(agent): run $RUN_ID"
           git push origin main
 
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitcorps-run-\${{ inputs.runId }}
+          path: |
+            RUN_SUMMARY.md
+            AGENT_SESSION_LOG.txt
+          if-no-files-found: ignore
+
       - name: Mark run status fallback
         if: always()
-        run: echo "RUN_STATUS=failed" >> "$GITHUB_ENV"
+        run: |
+          echo "RUN_STATUS=failed" >> "$GITHUB_ENV"
+          echo "RUN_SPENT_CENTS=0" >> "$GITHUB_ENV"
 
       - name: Mark run status success
         if: success()
-        run: echo "RUN_STATUS=succeeded" >> "$GITHUB_ENV"
+        run: |
+          echo "RUN_STATUS=succeeded" >> "$GITHUB_ENV"
+          echo "RUN_SPENT_CENTS=$BUDGET_CENTS" >> "$GITHUB_ENV"
 
       - name: Notify backend runFinished
         if: always()
         run: |
-          FINISH_PAYLOAD=$(node -e 'const fs=require("fs");const p="RUN_SUMMARY.md";const txt=fs.existsSync(p)?fs.readFileSync(p,"utf8"):"Run finished without summary.";const spent=Number(process.env.BUDGET_CENTS||"0");process.stdout.write(JSON.stringify({projectId:process.env.PROJECT_ID,runId:process.env.RUN_ID,status:process.env.RUN_STATUS||"failed",spentCents:Number.isFinite(spent)?spent:0,summaryMd:txt}));')
-          curl -fsSL -X POST "$BACKEND_BASE_URL/runFinished" \\
+          FINISH_PAYLOAD=$(node -e 'const fs=require("fs");const p="RUN_SUMMARY.md";const txt=fs.existsSync(p)?fs.readFileSync(p,"utf8"):"Run finished without summary.";const spent=Number(process.env.RUN_SPENT_CENTS||"0");process.stdout.write(JSON.stringify({projectId:process.env.PROJECT_ID,runId:process.env.RUN_ID,status:process.env.RUN_STATUS||"failed",spentCents:Number.isFinite(spent)?Math.max(0,spent):0,summaryMd:txt}));')
+          curl -fsSL --retry 3 --retry-all-errors -X POST "$BACKEND_BASE_URL/runFinished" \\
             -H "Authorization: Bearer $RUN_TOKEN" \\
             -H "Content-Type: application/json" \\
             -d "$FINISH_PAYLOAD"

@@ -13,7 +13,7 @@ import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import { z } from "zod";
 import { getEnvConfig } from "./config/env";
 import { getGithubClient } from "./github/client";
-import { createProjectRepoAndSeed } from "./github/repo";
+import { createProjectRepoAndSeed, deleteRepoByFullName } from "./github/repo";
 import { getDb } from "./lib/firestore";
 import { computeRepoCreateHeuristic } from "./lib/githubPreflight";
 import {
@@ -34,6 +34,7 @@ import {
 import { validateRunTokenFromRequest } from "./lib/runAuth";
 import { isAllowedReturnUrl } from "./lib/urlSecurity";
 import { mitLicenseText } from "./templates/license";
+import { gitcorpsAgentInstructions } from "./templates/agent";
 import { gitcorpsRunnerScript } from "./templates/runner";
 import { initialStatusTemplate } from "./templates/status";
 import { gitcorpsWorkflowYaml } from "./templates/workflow";
@@ -55,6 +56,11 @@ const createFundingCheckoutSchema = z.object({
   amountCents: z.number().int().min(50).max(500_000),
   successUrl: z.string().url(),
   cancelUrl: z.string().url(),
+});
+
+const deleteProjectSchema = z.object({
+  projectId: z.string().min(3),
+  confirmationName: z.string().min(1).max(120),
 });
 
 function assertAuth<T>(request: CallableRequest<T>) {
@@ -253,6 +259,7 @@ export const createProject = onCall(
     const statusTemplate = initialStatusTemplate(payload.name);
     const workflowYaml = gitcorpsWorkflowYaml();
     const runnerScript = gitcorpsRunnerScript();
+    const agentInstructions = gitcorpsAgentInstructions();
     const projectRef = db.collection("projects").doc();
     const slugRef = db.collection("projectSlugs").doc(payload.slug);
 
@@ -286,6 +293,7 @@ export const createProject = onCall(
         statusTemplate,
         workflowYaml,
         runnerScript,
+        agentInstructions,
         licenseText: config.DEFAULT_LICENSE === "MIT" ? mitLicenseText : mitLicenseText,
       });
 
@@ -430,6 +438,108 @@ export const createFundingCheckoutSession = onCall(
     return {
       sessionDocumentPath: sessionRef.path,
       sessionId: sessionRef.id,
+    };
+  },
+);
+
+export const deleteProject = onCall(
+  {
+    region,
+    memory: "512MiB",
+  },
+  async (request) => {
+    const uid = assertAuth(request);
+    const payload = deleteProjectSchema.parse(request.data);
+    const db = getDb();
+    const projectRef = db.collection("projects").doc(payload.projectId);
+    const projectSnap = await projectRef.get();
+
+    if (!projectSnap.exists) {
+      throw new HttpsError("not-found", "Project not found.");
+    }
+
+    const projectData = projectSnap.data() || {};
+    const createdByUid = String(projectData.createdByUid || "");
+    if (!createdByUid || createdByUid !== uid) {
+      throw new HttpsError("permission-denied", "Only the project creator can delete this project.");
+    }
+
+    const projectName = String(projectData.name || "");
+    if (payload.confirmationName.trim() !== projectName) {
+      throw new HttpsError("invalid-argument", "Project name confirmation does not match.");
+    }
+
+    const currentRunId = typeof projectData.currentRunId === "string" ? projectData.currentRunId : "";
+    if (currentRunId.length > 0) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Cannot delete a project while a run is active. Wait for the run to finish first.",
+      );
+    }
+
+    const repoFullName = typeof projectData.repoFullName === "string" ? projectData.repoFullName : "";
+    if (repoFullName.length > 0) {
+      try {
+        await deleteRepoByFullName(repoFullName);
+      } catch (error) {
+        logger.error("deleteProject failed while deleting GitHub repo", {
+          projectId: payload.projectId,
+          repoFullName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw new HttpsError(
+          "internal",
+          "Failed to delete the backing GitHub repository. Project was not deleted.",
+        );
+      }
+    }
+
+    const slug = typeof projectData.slug === "string" ? projectData.slug : "";
+    const slugDocs = await db
+      .collection("projectSlugs")
+      .where("projectId", "==", payload.projectId)
+      .get();
+
+    const cleanupBatch = db.batch();
+    cleanupBatch.delete(db.collection("activeRuns").doc(payload.projectId));
+    cleanupBatch.delete(db.collection("runQueue").doc(payload.projectId));
+    if (slug.length > 0) {
+      cleanupBatch.delete(db.collection("projectSlugs").doc(slug));
+    }
+    for (const slugDoc of slugDocs.docs) {
+      cleanupBatch.delete(slugDoc.ref);
+    }
+    await cleanupBatch.commit();
+
+    const maybeRecursive = db as unknown as {
+      recursiveDelete?: (ref: FirebaseFirestore.DocumentReference) => Promise<void>;
+    };
+    if (typeof maybeRecursive.recursiveDelete === "function") {
+      await maybeRecursive.recursiveDelete(projectRef);
+    } else {
+      const runsSnapshot = await projectRef.collection("runs").limit(500).get();
+      const fundingSnapshot = await projectRef.collection("fundingEvents").limit(500).get();
+      const batch = db.batch();
+      for (const doc of runsSnapshot.docs) {
+        batch.delete(doc.ref);
+      }
+      for (const doc of fundingSnapshot.docs) {
+        batch.delete(doc.ref);
+      }
+      batch.delete(projectRef);
+      await batch.commit();
+    }
+
+    logger.info("Project deleted by creator", {
+      projectId: payload.projectId,
+      uid,
+      repoFullName,
+    });
+
+    return {
+      ok: true,
+      projectId: payload.projectId,
+      repoDeleted: repoFullName.length > 0,
     };
   },
 );

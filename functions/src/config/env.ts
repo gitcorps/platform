@@ -7,6 +7,7 @@ const DEFAULTS = {
   defaultLicense: "MIT",
   llmProvider: "openai",
   llmModel: "gpt-4.1",
+  agentRuntime: "copilot_cli",
 };
 
 function readConfigValue(key: string): string | undefined {
@@ -52,7 +53,7 @@ const envSchema = z.object({
   PER_PROJECT_MAX_DAILY_SPEND_USD: numberFromEnv(100),
   LLM_PROVIDER_DEFAULT: z.string().default(DEFAULTS.llmProvider),
   LLM_MODEL_DEFAULT: z.string().default(DEFAULTS.llmModel),
-  AGENT_RUNTIME_DEFAULT: z.string().default("node_builtin"),
+  AGENT_RUNTIME_DEFAULT: z.string().default(DEFAULTS.agentRuntime),
   BACKEND_BASE_URL: z.string().optional(),
   RUN_TOKEN_TTL_MINUTES: numberFromEnv(120),
   RUN_QUEUE_CHECK_LIMIT: numberFromEnv(25),

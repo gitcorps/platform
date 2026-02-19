@@ -2,6 +2,7 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { logger } from "firebase-functions";
 import { getEnvConfig } from "../config/env";
 import { dispatchWorkflow, syncProjectAutomationFiles } from "../github/repo";
+import { gitcorpsAgentInstructions } from "../templates/agent";
 import { gitcorpsRunnerScript } from "../templates/runner";
 import { gitcorpsWorkflowYaml } from "../templates/workflow";
 import {
@@ -277,6 +278,7 @@ export async function maybeStartRun(projectId: string): Promise<MaybeStartRunRes
       repoFullName,
       workflowYaml: gitcorpsWorkflowYaml(),
       runnerScript: gitcorpsRunnerScript(),
+      agentInstructions: gitcorpsAgentInstructions(),
     });
 
     await dispatchWorkflow({

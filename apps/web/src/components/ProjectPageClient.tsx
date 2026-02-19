@@ -12,8 +12,9 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { Disclaimer } from "./Disclaimer";
-import { createFundingCheckoutSession, waitForCheckoutUrl } from "../lib/api";
+import { createFundingCheckoutSession, deleteProject, waitForCheckoutUrl } from "../lib/api";
 import {
+  observeAuth,
   getFirebaseAuth,
   getFirebaseDb,
   isFirebaseConfigured,
@@ -27,6 +28,7 @@ interface ProjectData {
   manifestoMd: string;
   balanceCents: number;
   status: string;
+  createdByUid: string;
   repoUrl?: string;
   repoFullName?: string;
 }
@@ -71,9 +73,14 @@ function mapRun(docData: DocumentData, id: string): RunData {
 export function ProjectPageClient({ slug }: { slug: string }) {
   const [project, setProject] = useState<ProjectData | null>(null);
   const [runs, setRuns] = useState<RunData[]>([]);
+  const [currentUid, setCurrentUid] = useState<string | null>(null);
   const [fundingUsd, setFundingUsd] = useState(15);
   const [fundingLoading, setFundingLoading] = useState(false);
   const [fundingError, setFundingError] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteConfirmationName, setDeleteConfirmationName] = useState("");
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const firebaseConfigured = isFirebaseConfigured();
 
   function getDbOrThrow() {
@@ -83,6 +90,16 @@ export function ProjectPageClient({ slug }: { slug: string }) {
 
     return getFirebaseDb();
   }
+
+  useEffect(() => {
+    if (!firebaseConfigured) {
+      return;
+    }
+
+    return observeAuth((user) => {
+      setCurrentUid(user?.uid || null);
+    });
+  }, [firebaseConfigured]);
 
   useEffect(() => {
     if (!firebaseConfigured) {
@@ -106,6 +123,7 @@ export function ProjectPageClient({ slug }: { slug: string }) {
         manifestoMd: String(data.manifestoMd || ""),
         balanceCents: Number(data.balanceCents || 0),
         status: String(data.status || "active"),
+        createdByUid: String(data.createdByUid || ""),
         repoUrl: typeof data.repoUrl === "string" ? data.repoUrl : undefined,
         repoFullName: typeof data.repoFullName === "string" ? data.repoFullName : undefined,
       });
@@ -139,6 +157,7 @@ export function ProjectPageClient({ slug }: { slug: string }) {
   }, [project?.id, firebaseConfigured]);
 
   const latestRun = useMemo(() => runs[0], [runs]);
+  const isCreator = Boolean(project?.createdByUid && currentUid && project.createdByUid === currentUid);
 
   async function ensureSignedIn() {
     const auth = getFirebaseAuth();
@@ -176,6 +195,27 @@ export function ProjectPageClient({ slug }: { slug: string }) {
     } catch (error) {
       setFundingError(error instanceof Error ? error.message : String(error));
       setFundingLoading(false);
+    }
+  }
+
+  async function handleDeleteProject() {
+    if (!project || !isCreator) {
+      return;
+    }
+
+    setDeleteError(null);
+    setDeleteLoading(true);
+
+    try {
+      await ensureSignedIn();
+      await deleteProject({
+        projectId: project.id,
+        confirmationName: deleteConfirmationName,
+      });
+      window.location.assign("/");
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : String(error));
+      setDeleteLoading(false);
     }
   }
 
@@ -270,6 +310,64 @@ export function ProjectPageClient({ slug }: { slug: string }) {
           </article>
         ))}
       </div>
+
+      {isCreator ? (
+        <>
+          <h2>Delete Project</h2>
+          <p className="muted">
+            This permanently deletes the project and attempts to delete the backing GitHub repository.
+          </p>
+          {!deleteOpen ? (
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => {
+                setDeleteOpen(true);
+                setDeleteError(null);
+                setDeleteConfirmationName("");
+              }}
+            >
+              Delete Project
+            </button>
+          ) : (
+            <div className="form-grid">
+              <label>
+                Type project name to confirm deletion
+                <input
+                  type="text"
+                  value={deleteConfirmationName}
+                  onChange={(event) => {
+                    setDeleteConfirmationName(event.target.value);
+                  }}
+                  placeholder={project.name}
+                />
+              </label>
+              <div style={{ display: "flex", gap: 12 }}>
+                <button
+                  type="button"
+                  className="button-secondary"
+                  onClick={() => {
+                    setDeleteOpen(false);
+                    setDeleteError(null);
+                    setDeleteConfirmationName("");
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="button-primary"
+                  disabled={deleteLoading || deleteConfirmationName !== project.name}
+                  onClick={handleDeleteProject}
+                >
+                  {deleteLoading ? "Deleting..." : "Confirm Delete"}
+                </button>
+              </div>
+              {deleteError ? <p className="muted">Delete error: {deleteError}</p> : null}
+            </div>
+          )}
+        </>
+      ) : null}
     </section>
   );
 }

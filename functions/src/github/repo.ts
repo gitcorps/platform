@@ -15,6 +15,7 @@ export interface CreateRepoInput {
   statusTemplate: string;
   workflowYaml: string;
   runnerScript: string;
+  agentInstructions: string;
   licenseText: string;
 }
 
@@ -84,6 +85,7 @@ export async function syncProjectAutomationFiles(input: {
   repoFullName: string;
   workflowYaml: string;
   runnerScript: string;
+  agentInstructions: string;
 }): Promise<void> {
   const [owner, repo] = input.repoFullName.split("/");
 
@@ -101,6 +103,11 @@ export async function syncProjectAutomationFiles(input: {
       path: "tools/gitcorps_runner.mjs",
       content: input.runnerScript,
       message: "chore: sync gitcorps runner",
+    },
+    {
+      path: ".github/agents/gitcorps.agent.md",
+      content: input.agentInstructions,
+      message: "chore: sync gitcorps custom agent",
     },
   ];
 
@@ -149,6 +156,11 @@ export async function createProjectRepoAndSeed(input: CreateRepoInput): Promise<
       message: "feat: add gitcorps runner entrypoint",
     },
     {
+      path: ".github/agents/gitcorps.agent.md",
+      content: input.agentInstructions,
+      message: "docs: add gitcorps custom agent instructions",
+    },
+    {
       path: "LICENSE",
       content: input.licenseText,
       message: "chore: set default license",
@@ -169,6 +181,26 @@ export interface DispatchWorkflowInput {
   repoFullName: string;
   workflowFile: string;
   inputs: Record<string, string>;
+}
+
+export async function deleteRepoByFullName(repoFullName: string): Promise<void> {
+  const octokit = await getGithubClient();
+  const [owner, repo] = repoFullName.split("/");
+
+  if (!owner || !repo) {
+    throw new Error(`Invalid repoFullName: ${repoFullName}`);
+  }
+
+  try {
+    await octokit.repos.delete({ owner, repo });
+  } catch (error) {
+    const err = error as { status?: number; message?: string };
+    if (err.status === 404) {
+      return;
+    }
+    const status = typeof err.status === "number" ? ` [status=${err.status}]` : "";
+    throw new Error(`Failed to delete repository '${repoFullName}'${status}: ${err.message || "unknown error"}`);
+  }
 }
 
 export async function dispatchWorkflow(input: DispatchWorkflowInput): Promise<void> {

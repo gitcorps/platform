@@ -9,6 +9,7 @@ const firestore_1 = require("firebase-admin/firestore");
 const firebase_functions_1 = require("firebase-functions");
 const env_1 = require("../config/env");
 const repo_1 = require("../github/repo");
+const agent_1 = require("../templates/agent");
 const runner_1 = require("../templates/runner");
 const workflow_1 = require("../templates/workflow");
 const orchestratorRules_1 = require("./orchestratorRules");
@@ -217,6 +218,7 @@ async function maybeStartRun(projectId) {
             repoFullName,
             workflowYaml: (0, workflow_1.gitcorpsWorkflowYaml)(),
             runnerScript: (0, runner_1.gitcorpsRunnerScript)(),
+            agentInstructions: (0, agent_1.gitcorpsAgentInstructions)(),
         });
         await (0, repo_1.dispatchWorkflow)({
             repoFullName,

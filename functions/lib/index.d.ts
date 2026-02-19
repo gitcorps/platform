@@ -7,6 +7,11 @@ export declare const createFundingCheckoutSession: import("firebase-functions/v2
     sessionDocumentPath: string;
     sessionId: string;
 }>, unknown>;
+export declare const deleteProject: import("firebase-functions/v2/https").CallableFunction<any, Promise<{
+    ok: boolean;
+    projectId: string;
+    repoDeleted: boolean;
+}>, unknown>;
 export declare const onCheckoutSessionUpdated: import("firebase-functions").CloudFunction<import("firebase-functions/v2/firestore").FirestoreEvent<import("firebase-functions").Change<import("firebase-functions/v2/firestore").DocumentSnapshot> | undefined, {
     sessionId: string;
     uid: string;

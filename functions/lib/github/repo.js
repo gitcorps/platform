@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.syncProjectAutomationFiles = syncProjectAutomationFiles;
 exports.createProjectRepoAndSeed = createProjectRepoAndSeed;
+exports.deleteRepoByFullName = deleteRepoByFullName;
 exports.dispatchWorkflow = dispatchWorkflow;
 const node_buffer_1 = require("node:buffer");
 const client_1 = require("./client");
@@ -69,6 +70,11 @@ async function syncProjectAutomationFiles(input) {
             content: input.runnerScript,
             message: "chore: sync gitcorps runner",
         },
+        {
+            path: ".github/agents/gitcorps.agent.md",
+            content: input.agentInstructions,
+            message: "chore: sync gitcorps custom agent",
+        },
     ];
     for (const file of files) {
         await upsertFile(owner, repo, file);
@@ -111,6 +117,11 @@ async function createProjectRepoAndSeed(input) {
             message: "feat: add gitcorps runner entrypoint",
         },
         {
+            path: ".github/agents/gitcorps.agent.md",
+            content: input.agentInstructions,
+            message: "docs: add gitcorps custom agent instructions",
+        },
+        {
             path: "LICENSE",
             content: input.licenseText,
             message: "chore: set default license",
@@ -123,6 +134,24 @@ async function createProjectRepoAndSeed(input) {
         repoFullName,
         repoUrl: createResult.data.html_url,
     };
+}
+async function deleteRepoByFullName(repoFullName) {
+    const octokit = await (0, client_1.getGithubClient)();
+    const [owner, repo] = repoFullName.split("/");
+    if (!owner || !repo) {
+        throw new Error(`Invalid repoFullName: ${repoFullName}`);
+    }
+    try {
+        await octokit.repos.delete({ owner, repo });
+    }
+    catch (error) {
+        const err = error;
+        if (err.status === 404) {
+            return;
+        }
+        const status = typeof err.status === "number" ? ` [status=${err.status}]` : "";
+        throw new Error(`Failed to delete repository '${repoFullName}'${status}: ${err.message || "unknown error"}`);
+    }
 }
 async function dispatchWorkflow(input) {
     const octokit = await (0, client_1.getGithubClient)();
